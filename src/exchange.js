@@ -222,6 +222,84 @@ class MexcExchange {
     return this.priceCache[symbol] || null;
   }
 
+  // ===== ZERO-FEE PAIR SCANNER =====
+
+  async getContractDetails() {
+    return this.request('GET', '/api/v1/contract/detail');
+  }
+
+  async getZeroFeePairs() {
+    const details = await this.getContractDetails();
+    if (!details || !Array.isArray(details)) return [];
+
+    return details
+      .filter(d => {
+        const maker = parseFloat(d.makerFeeRate || 0);
+        const taker = parseFloat(d.takerFeeRate || 0);
+        return maker === 0 && taker === 0;
+      })
+      .map(d => ({
+        symbol: d.symbol,
+        minVolume: d.minVol || 1,
+        contractSize: d.contractSize || 1,
+        maxLeverage: d.maxLeverage || 100,
+        settleCoin: d.settleCoin || 'USDT'
+      }));
+  }
+
+  async getTopVolumeZeroFeePairs(limit = 20) {
+    const [zeroFee, tickers] = await Promise.all([
+      this.getZeroFeePairs(),
+      this.getTickers()
+    ]);
+
+    const zeroFeeSet = new Set(zeroFee.map(p => p.symbol));
+    const tickerMap = {};
+    if (tickers && Array.isArray(tickers)) {
+      for (const t of tickers) tickerMap[t.symbol] = t;
+    }
+
+    // Filter USDT-settled pairs only, merge with ticker data
+    const pairs = zeroFee
+      .filter(p => p.settleCoin === 'USDT')
+      .map(p => {
+        const ticker = tickerMap[p.symbol] || {};
+        return {
+          ...p,
+          volume24h: parseFloat(ticker.quoteVolume24h || ticker.vol24h || 0),
+          lastPrice: parseFloat(ticker.lastPrice || 0),
+          change24h: parseFloat(ticker.riseFallRate || 0) * 100,
+          high24h: parseFloat(ticker.highPrice24h || 0),
+          low24h: parseFloat(ticker.lowPrice24h || 0)
+        };
+      })
+      .sort((a, b) => b.volume24h - a.volume24h)
+      .slice(0, limit);
+
+    return pairs;
+  }
+
+  // Get best pairs for scalping: 0% fee + high volume + good volatility
+  async getBestScalpingPairs(limit = 10) {
+    const pairs = await this.getTopVolumeZeroFeePairs(50);
+
+    return pairs
+      .filter(p => {
+        // Must have volume and price data
+        if (!p.volume24h || !p.lastPrice) return false;
+        // Filter out stablecoins and low-vol pairs
+        const stablecoins = ['USDC_USDT', 'BUSD_USDT', 'DAI_USDT', 'TUSD_USDT', 'USDD_USDT'];
+        if (stablecoins.includes(p.symbol)) return false;
+        // Must have some volatility (>0.5% range)
+        if (p.high24h && p.low24h) {
+          const range = (p.high24h - p.low24h) / p.low24h * 100;
+          if (range < 0.5) return false;
+        }
+        return true;
+      })
+      .slice(0, limit);
+  }
+
   // Convert MEXC kline interval format
   static intervalToMexc(interval) {
     const map = {

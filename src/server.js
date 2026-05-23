@@ -20,15 +20,19 @@ app.use(express.static(path.join(__dirname, '..', 'dashboard')));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-// Create bot
+// Create bot — auto-discover zero-fee pairs, optimized for $10 scalping
 const bot = new TradingBot({
-  symbols: ['BTC_USDT', 'ETH_USDT', 'SOL_USDT'],
-  timeframes: ['15m', '1h', '4h'],
-  strategies: ['trend_following', 'mean_reversion', 'breakout', 'smart_money'],
-  risk: { perTrade: 1, maxDaily: 5, maxPositions: 3, maxLeverage: 10 },
+  symbols: [], // Empty = auto-discover zero-fee pairs
+  timeframes: ['5m', '15m', '1h'],
+  strategies: ['trend_following', 'mean_reversion', 'scalping', 'breakout'],
+  risk: { perTrade: 3, maxDaily: 10, maxPositions: 2, maxLeverage: 10 },
   mode: process.env.MODE || 'paper',
   apiKey: process.env.MEXC_API_KEY,
-  apiSecret: process.env.MEXC_API_SECRET
+  apiSecret: process.env.MEXC_API_SECRET,
+  balance: parseFloat(process.env.BALANCE || '10'),
+  autoDiscoverPairs: true,
+  maxPairs: 10,
+  leverage: 10
 });
 
 // WebSocket handler
@@ -101,6 +105,15 @@ app.get('/api/analysis/:symbol', (req, res) => {
 // Risk status
 app.get('/api/risk', (req, res) => {
   res.json(bot.risk.getRiskStatus(bot.accountBalance));
+});
+
+// Zero-fee pairs
+app.get('/api/pairs', (req, res) => {
+  res.json({
+    activeSymbols: bot.activeSymbols,
+    zeroFeePairs: bot.zeroFeePairs,
+    autoDiscover: bot.config.autoDiscoverPairs
+  });
 });
 
 // Balance

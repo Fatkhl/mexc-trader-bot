@@ -8,39 +8,58 @@ const notify = require('./notify');
 class TradingBot {
   constructor(config = {}) {
     this.config = {
-      symbols: config.symbols || ['BTC_USDT', 'ETH_USDT', 'SOL_USDT'],
-      timeframes: config.timeframes || ['15m', '1h', '4h'],
-      strategies: config.strategies || ['trend_following', 'mean_reversion'],
+      symbols: config.symbols || [], // Empty = auto-discover zero-fee pairs
+      timeframes: config.timeframes || ['5m', '15m', '1h'],
+      strategies: config.strategies || ['trend_following', 'mean_reversion', 'scalping'],
       risk: config.risk || {},
       mode: config.mode || 'paper',
-      intervalMs: config.intervalMs || 60000, // Run every 60s
-      leverage: config.leverage || 5,
+      intervalMs: config.intervalMs || 30000, // 30s for scalping
+      leverage: config.leverage || 10,
+      autoDiscoverPairs: config.autoDiscoverPairs !== false, // Default true
+      maxPairs: config.maxPairs || 10,
+      pairRotationMinutes: config.pairRotationMinutes || 30,
+      minVolumeUSD: config.minVolumeUSD || 1000000, // $1M minimum 24h volume
+      balance: config.balance || 10, // Default $10
       ...config
     };
 
     this.exchange = new MexcExchange(config.apiKey, config.apiSecret);
-    this.risk = new RiskManager(this.config.risk);
+    this.risk = new RiskManager({ perTrade: 3, maxDaily: 10, maxPositions: 2, ...this.config.risk });
     this.activeStrategies = this.config.strategies
       .filter(s => STRATEGIES[s])
       .map(s => STRATEGIES[s]);
 
     this.running = false;
     this.loopTimer = null;
-    this.accountBalance = 10000; // Default paper balance
-    this.priceData = {};         // Cache of candle data
-    this.lastAnalysis = {};      // Cache of last analysis per symbol
-    this.wsClients = new Set();  // WebSocket clients for dashboard
+    this.rotationTimer = null;
+    this.accountBalance = this.config.balance;
+    this.priceData = {};
+    this.lastAnalysis = {};
+    this.wsClients = new Set();
     this.tradeCounter = 0;
+    this.zeroFeePairs = [];
+    this.activeSymbols = [];
+    this.pairStats = {}; // Track per-pair performance
   }
 
   async start() {
     if (this.running) return;
     this.running = true;
     console.log(`[Bot] Starting in ${this.config.mode.toUpperCase()} mode`);
-    console.log(`[Bot] Symbols: ${this.config.symbols.join(', ')}`);
+    console.log(`[Bot] Balance: $${this.accountBalance}`);
     console.log(`[Bot] Strategies: ${this.activeStrategies.map(s => s.name).join(', ')}`);
 
     notify.notifyBotStatus('started', this.config.mode);
+
+    // Auto-discover zero-fee pairs
+    if (this.config.autoDiscoverPairs && this.config.symbols.length === 0) {
+      console.log('[Bot] Discovering zero-fee pairs...');
+      await this._discoverPairs();
+    } else {
+      this.activeSymbols = this.config.symbols;
+    }
+
+    console.log(`[Bot] Trading pairs: ${this.activeSymbols.join(', ')}`);
 
     // Try to get real balance if API configured
     if (this.config.apiKey && this.config.mode === 'live') {
@@ -57,7 +76,7 @@ class TradingBot {
     // Connect WebSocket
     try {
       await this.exchange.connectWS();
-      for (const symbol of this.config.symbols) {
+      for (const symbol of this.activeSymbols) {
         this.exchange.subscribeTicker(symbol, (data) => {
           this._broadcastToClients({ type: 'price', symbol, data });
         });
@@ -69,11 +88,64 @@ class TradingBot {
     // Main loop
     await this._runLoop();
     this.loopTimer = setInterval(() => this._runLoop(), this.config.intervalMs);
+
+    // Pair rotation every 30 minutes
+    if (this.config.autoDiscoverPairs) {
+      this.rotationTimer = setInterval(() => this._rotatePairs(), this.config.pairRotationMinutes * 60000);
+    }
+  }
+
+  async _discoverPairs() {
+    try {
+      const bestPairs = await this.exchange.getBestScalpingPairs(this.config.maxPairs);
+      this.zeroFeePairs = bestPairs;
+      this.activeSymbols = bestPairs.map(p => p.symbol);
+
+      console.log(`[Bot] Found ${bestPairs.length} zero-fee pairs with high volume:`);
+      for (const p of bestPairs) {
+        console.log(`  ${p.symbol} | Vol: $${(p.volume24h / 1e6).toFixed(1)}M | Price: ${p.lastPrice} | 24h: ${p.change24h >= 0 ? '+' : ''}${p.change24h.toFixed(2)}%`);
+      }
+
+      // Subscribe to new symbols
+      for (const symbol of this.activeSymbols) {
+        this.exchange.subscribeTicker(symbol, (data) => {
+          this._broadcastToClients({ type: 'price', symbol, data });
+        });
+      }
+
+      this._broadcastToClients({ type: 'pairs_update', data: { pairs: bestPairs, zeroFeeCount: bestPairs.length } });
+    } catch (err) {
+      console.error('[Bot] Pair discovery failed:', err.message);
+      // Fallback to major pairs
+      this.activeSymbols = ['SOL_USDT', 'DOGE_USDT', 'XRP_USDT', 'PEPE_USDT', 'SUI_USDT'];
+      console.log(`[Bot] Using fallback pairs: ${this.activeSymbols.join(', ')}`);
+    }
+  }
+
+  async _rotatePairs() {
+    if (!this.running) return;
+    console.log('[Bot] Rotating pairs based on volume...');
+    try {
+      const newPairs = await this.exchange.getBestScalpingPairs(this.config.maxPairs);
+      const newSymbols = newPairs.map(p => p.symbol);
+
+      // Only rotate if there's a meaningful change
+      const overlap = newSymbols.filter(s => this.activeSymbols.includes(s)).length;
+      if (overlap < newSymbols.length * 0.5) {
+        this.activeSymbols = newSymbols;
+        this.zeroFeePairs = newPairs;
+        console.log(`[Bot] Rotated to: ${this.activeSymbols.join(', ')}`);
+        this._broadcastToClients({ type: 'pairs_update', data: { pairs: newPairs } });
+      }
+    } catch (err) {
+      console.error('[Bot] Pair rotation failed:', err.message);
+    }
   }
 
   stop() {
     this.running = false;
     if (this.loopTimer) clearInterval(this.loopTimer);
+    if (this.rotationTimer) clearInterval(this.rotationTimer);
     console.log('[Bot] Stopped');
     notify.notifyBotStatus('stopped', this.config.mode);
   }
@@ -81,7 +153,7 @@ class TradingBot {
   async _runLoop() {
     if (!this.running) return;
     try {
-      console.log(`[Bot] Running analysis loop at ${new Date().toISOString()}`);
+      console.log(`[Bot] Running analysis loop at ${new Date().toISOString()} | Pairs: ${this.activeSymbols.length}`);
 
       // 1. Fetch candles for all symbols + timeframes
       await this._fetchAllData();
@@ -90,7 +162,7 @@ class TradingBot {
       await this._manageOpenPositions();
 
       // 3. Run analysis and find signals
-      for (const symbol of this.config.symbols) {
+      for (const symbol of this.activeSymbols) {
         await this._analyzeAndTrade(symbol);
       }
 
@@ -102,7 +174,7 @@ class TradingBot {
   }
 
   async _fetchAllData() {
-    for (const symbol of this.config.symbols) {
+    for (const symbol of this.activeSymbols) {
       if (!this.priceData[symbol]) this.priceData[symbol] = {};
 
       for (const tf of this.config.timeframes) {
@@ -371,7 +443,8 @@ class TradingBot {
       running: this.running,
       mode: this.config.mode,
       balance: this.accountBalance,
-      symbols: this.config.symbols,
+      symbols: this.activeSymbols,
+      zeroFeePairs: this.zeroFeePairs.length,
       strategies: this.activeStrategies.map(s => s.name),
       openPositions: db.getOpenTrades().length,
       totalTrades: this.tradeCounter
@@ -379,7 +452,10 @@ class TradingBot {
   }
 
   updateConfig(newConfig) {
-    if (newConfig.symbols) this.config.symbols = newConfig.symbols;
+    if (newConfig.symbols) {
+      this.config.symbols = newConfig.symbols;
+      this.activeSymbols = newConfig.symbols;
+    }
     if (newConfig.timeframes) this.config.timeframes = newConfig.timeframes;
     if (newConfig.strategies) {
       this.activeStrategies = newConfig.strategies
